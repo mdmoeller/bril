@@ -29,6 +29,7 @@ interface Op {
   args?: Ident[];
   funcs?: Ident[];
   labels?: Ident[];
+  visited?: boolean;
 }
 
 /**
@@ -70,6 +71,7 @@ export interface Constant {
   value: Value;
   dest: Ident;
   type: Type;
+  visited?: boolean;
 }
 
 
@@ -109,6 +111,7 @@ export type OpCode = ValueOpCode | EffectOpCode;
  */
 export interface Label {
   label: Ident;
+  visited?: boolean;
 }
 
 /*

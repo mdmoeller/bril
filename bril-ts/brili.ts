@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import * as bril from './bril';
 import {readStdin, unreachable} from './util';
+import * as fs from 'fs';
 
 /**
  * An interpreter error to print to the console.
@@ -310,6 +311,10 @@ type State = {
 
   // For speculation: the state at the point where speculation began.
   specparent: State | null,
+
+  trace_stream: fs.WriteStream,
+  tracing: boolean,
+  tracing_opt: boolean,
 }
 
 /**
@@ -345,6 +350,8 @@ function evalCall(instr: bril.Operation, state: State): Action {
     newEnv.set(params[i].name, value);
   }
 
+  let discard = fs.createWriteStream('/dev/null');
+
   // Invoke the interpreter on the function.
   let newState: State = {
     env: newEnv,
@@ -354,6 +361,9 @@ function evalCall(instr: bril.Operation, state: State): Action {
     lastlabel: null,
     curlabel: null,
     specparent: null,  // Speculation not allowed.
+    trace_stream: discard,
+    tracing: false,
+    tracing_opt: state.tracing_opt
   }
   let retVal = evalFunc(func, newState);
   state.icount = newState.icount;
@@ -392,6 +402,95 @@ function evalCall(instr: bril.Operation, state: State): Action {
   return NEXT;
 }
 
+
+/**
+ * Start emitting instructions for a trace to be used for speculative
+ * optimization.
+ */
+function start_tracing(state: State): void {
+  state.trace_stream.write('{"instrs": [ {"op":"speculate"}, \n');
+  state.tracing = true;
+}
+
+/**
+ * Stop emitting instructions for the trace and emit a jump to `label` (if
+ * given).
+ */
+function stop_tracing(state: State, label: string): void {
+  let com: bril.EffectOperation = {
+    op: 'commit',
+  };
+  let j: bril.EffectOperation = {
+    op: 'jmp',
+    labels: [label],
+  };
+  state.trace_stream.write(JSON.stringify(com) + ',\n');
+  state.trace_stream.write(JSON.stringify(j) + ']}\n');
+  state.tracing = false;
+}
+
+/**
+ * Emit a guard that will force recovery (to prevent a side-effect in a
+ * speculative context).
+ */
+function stop_tracing_recover(state: State): void {
+  let f: bril.Constant = {
+    op: 'const',
+    type: 'bool',
+    value: false,
+    dest: '_f0',
+  };
+  let g: bril.EffectOperation = {
+    op: 'guard',
+    args: ["_f0"],
+    labels:  ['recover'],
+  };
+  state.trace_stream.write(JSON.stringify(f) + ',\n');
+  state.trace_stream.write(JSON.stringify(g) + ']}\n');
+  state.tracing = false;
+}
+
+
+/**
+ * Trace execution of this instruction by writing it (or, for a branch, a guard)
+ * to the tracing stream.
+ */
+function trace(instr: bril.Instruction, state: State): void {
+  /* Need to convert branches into guards */
+  if (instr.op === "br") {
+    let cond = getBool(instr, state.env, 0);
+    if (!cond) {
+      let negname = '_' + instr.args![0];
+      let neg: bril.ValueOperation = {
+        args: [instr.args![0]],
+        dest: negname,
+        op: 'not',
+        type: 'bool',
+      };
+      let g: bril.EffectOperation = {
+        op: 'guard',
+        args: [negname],
+        labels:  ['recover'],
+      };
+      state.trace_stream.write(JSON.stringify(neg) + ',\n');
+      state.trace_stream.write(JSON.stringify(g) + ',\n');
+    } else {
+      let g: bril.EffectOperation = {
+        op: "guard",
+        args: [instr.args![0]],
+        labels:  ['recover'],
+      };
+      state.trace_stream.write(JSON.stringify(g) + ',\n');
+    }
+  } else if (instr.op == "print" || instr.op == "store" || 
+             instr.op == "free"  || instr.op == "alloc") {
+    stop_tracing_recover(state);
+  } else if (instr.op != "jmp") {
+    state.trace_stream.write(JSON.stringify(instr) + ',\n');
+  }
+  instr.visited = true;
+}
+
 /**
  * Interpret an instruction in a given environment, possibly updating the
  * environment. If the instruction branches to a new label, return that label;
@@ -399,6 +498,14 @@ function evalCall(instr: bril.Operation, state: State): Action {
  * instruction or "end" to terminate the function.
  */
 function evalInstr(instr: bril.Instruction, state: State): Action {
+
+  /* Perform tracing */
+  if (state.tracing_opt && !instr.visited && state.tracing) {
+    trace(instr, state);
+  } else if (state.tracing_opt && state.tracing) {
+    state.tracing = false;
+  }
+
   state.icount += BigInt(1);
 
   // Check that we have the right number of arguments.
@@ -779,6 +886,11 @@ function evalFunc(func: bril.Function, state: State): Value | null {
       // Update CFG tracking for SSA phi nodes.
       state.lastlabel = state.curlabel;
       state.curlabel = line.label;
+      if (state.tracing_opt && state.tracing && line.visited) {
+          stop_tracing(state, line.label);
+      } else if (state.tracing_opt && state.tracing) {
+          line.visited = true;
+      }
     }
   }
 
@@ -839,9 +951,21 @@ function evalProg(prog: bril.Program) {
     args.splice(pidx, 1);
   }
 
+  let trace_opt = false;
+  let tidx = args.indexOf('-t');
+  if (tidx > -1) {
+    trace_opt = true;
+    args.splice(tidx, 1);
+  }
+
   // Remaining arguments are for the main function.k
   let expected = main.args || [];
   let newEnv = parseMainArguments(expected, args);
+
+  let tstream = fs.createWriteStream('/dev/null');
+  if (trace_opt) {
+    tstream = fs.createWriteStream('./profile.txt');
+  }
 
   let state: State = {
     funcs: prog.functions,
@@ -851,8 +975,17 @@ function evalProg(prog: bril.Program) {
     lastlabel: null,
     curlabel: null,
     specparent: null,
+    trace_stream: tstream,
+    tracing: true,
+    tracing_opt: trace_opt,
   }
+
+  if (trace_opt) {
+    start_tracing(state);
+  }
+
   evalFunc(main, state);
+
 
   if (!heap.isEmpty()) {
     throw error(`Some memory locations have not been freed by end of execution.`);
