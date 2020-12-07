@@ -298,7 +298,7 @@ let NEXT: Action = {"action": "next"};
  * The interpreter state that's threaded through recursive calls.
  */
 type State = {
-  env: Env,
+  readonly env: Env,
   readonly heap: Heap<Value>,
   readonly funcs: readonly bril.Function[],
 
@@ -413,10 +413,21 @@ function start_tracing(state: State): void {
 }
 
 /**
+ * Stop emitting instructions for the trace.
+ */
+function stop_tracing(state: State): void {
+  let com: bril.EffectOperation = {
+    op: 'commit',
+  };
+  state.trace_stream.write(JSON.stringify(com) + ']}\n');
+  state.tracing = false;
+}
+
+/**
  * Stop emitting instructions for the trace and emit a jump to `label` (if
  * given).
  */
-function stop_tracing(state: State, label: string): void {
+function stop_tracing_jmp(state: State, label: string): void {
   let com: bril.EffectOperation = {
     op: 'commit',
   };
@@ -483,7 +494,8 @@ function trace(instr: bril.Instruction, state: State): void {
       state.trace_stream.write(JSON.stringify(g) + ',\n');
     }
   } else if (instr.op == "print" || instr.op == "store" || 
-             instr.op == "free"  || instr.op == "alloc") {
+             instr.op == "free"  || instr.op == "alloc" || 
+             instr.op == "call") {
     stop_tracing_recover(state);
   } else if (instr.op != "jmp") {
     state.trace_stream.write(JSON.stringify(instr) + ',\n');
@@ -835,8 +847,11 @@ function evalFunc(func: bril.Function, state: State): Value | null {
       }
       case 'speculate': {
         // Begin speculation.
-        state.specparent = {...state};
-        state.env = new Map(state.env);
+        state = {
+          ...state,
+          env: new Map(state.env),  // Clone the environment.
+          specparent: state,  // Save current state for aborts.
+        };
         break;
       }
       case 'commit': {
@@ -852,14 +867,9 @@ function evalFunc(func: bril.Function, state: State): Value | null {
         if (!state.specparent) {
           throw error(`abort in non-speculative state`);
         }
-        // We do *not* restore `icount` from the saved state to ensure that we
-        // count "aborted" instructions.
-        Object.assign(state, {
-          env: state.specparent.env,
-          lastlabel: state.specparent.lastlabel,
-          curlabel: state.specparent.curlabel,
-          specparent: state.specparent.specparent,
-        });
+        let icount = state.icount;
+        state = state.specparent;
+        state.icount = icount;
         break;
       }
       case 'next':
@@ -869,6 +879,7 @@ function evalFunc(func: bril.Function, state: State): Value | null {
         unreachable(action);
         throw error(`unhandled action ${(action as any).action}`);
       }
+
       // Move to a label.
       if ('label' in action) {
         // Search for the label and transfer control.
@@ -888,7 +899,7 @@ function evalFunc(func: bril.Function, state: State): Value | null {
       state.lastlabel = state.curlabel;
       state.curlabel = line.label;
       if (state.tracing_opt && state.tracing && line.visited) {
-          stop_tracing(state, line.label);
+          stop_tracing_jmp(state, line.label);
       } else if (state.tracing_opt && state.tracing) {
           line.visited = true;
       }
@@ -987,6 +998,9 @@ function evalProg(prog: bril.Program) {
 
   evalFunc(main, state);
 
+  if (trace_opt && state.tracing) {
+     stop_tracing(state);
+  }
 
   if (!heap.isEmpty()) {
     throw error(`Some memory locations have not been freed by end of execution.`);
